@@ -1,57 +1,103 @@
-@echo off
-setlocal EnableExtensions DisableDelayedExpansion
-pushd "%~dp0" || exit /b 1
-
-set "VENV_PY=.venv\Scripts\python.exe"
-if exist "%VENV_PY%" goto check_models
-
-echo Creating a local Python environment...
-py -3.12 -c "import platform, sys, struct; sys.exit(sys.version_info[:2] != (3, 12) or struct.calcsize('P') != 8 or platform.machine().upper() not in ('AMD64', 'X86_64'))" >nul 2>&1
-if not errorlevel 1 goto create_with_launcher
-python -c "import platform, sys, struct; sys.exit(sys.version_info[:2] != (3, 12) or struct.calcsize('P') != 8 or platform.machine().upper() not in ('AMD64', 'X86_64'))" >nul 2>&1
-if errorlevel 1 goto python_missing
-python -m venv .venv
-if errorlevel 1 goto failed
-goto check_models
-
-:create_with_launcher
-py -3.12 -m venv .venv
-if errorlevel 1 goto failed
-
-:check_models
-for %%P in (fp32 fp16 int8) do (
-    if not exist "models\yolo11n-416-%%P.xml" goto export_models
-    if not exist "models\yolo11n-416-%%P.bin" goto export_models
-)
-"%VENV_PY%" -c "from importlib.util import find_spec; import sys; sys.exit(not all(find_spec(name) for name in ('cv2', 'numpy', 'openvino')))" >nul 2>&1
-if not errorlevel 1 goto launch
-"%VENV_PY%" -m pip install -r requirements.txt
-if errorlevel 1 goto failed
-goto launch
-
-:export_models
-echo Installing dependencies and preparing YOLO models. First run can take a few minutes.
-"%VENV_PY%" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-if errorlevel 1 goto failed
-"%VENV_PY%" -m pip install -r requirements-export.txt
-if errorlevel 1 goto failed
-"%VENV_PY%" export_model.py --int8
-if errorlevel 1 goto failed
-
-:launch
 "%VENV_PY%" demo.py %*
 if errorlevel 1 goto failed
 popd
 exit /b 0
 
-:python_missing
-echo Install Python 3.12 for Windows x86-64 from python.org, then run this file again.
-goto show_error
+:check_venv
+if not exist "%VENV_PY%" exit /b 1
+"%VENV_PY%" -I -c "%VENV_PROBE%" >nul 2>&1
+exit /b %ERRORLEVEL%
+
+:models_ready
+for %%P in (fp32 fp16 int8) do (
+    if not exist "models\yolo11n-416-%%P.xml" exit /b 1
+    if not exist "models\yolo11n-416-%%P.bin" exit /b 1
+)
+exit /b 0
 
 :failed
 echo The demo stopped. Check the error above for details.
-
-:show_error
 popd
 pause
 exit /b 1
+
+:folder_error
+echo Could not open the YOLO demo folder.
+pause
+exit /b 1
+
+:embedded_python_setup
+$ErrorActionPreference = 'Stop'
+$projectRoot = Split-Path -LiteralPath $env:YOLO_LAUNCHER
+Set-Location -LiteralPath $projectRoot
+$venvPath = Join-Path $projectRoot $env:YOLO_VENV_DIR
+$pythonProbe = "import platform, struct, sys; sys.exit(1) if sys.version_info[:2] != (3, 12) or struct.calcsize('P') != 8 or platform.machine().upper() not in ('AMD64', 'X86_64') else print(sys._base_executable)"
+
+function Get-Python312 {
+    param([string]$Command, [string[]]$CommandArgs = @())
+
+    $ErrorActionPreference = 'Continue'
+    $result = & $Command @CommandArgs -I -c $pythonProbe 2>$null
+    if ($LASTEXITCODE -eq 0 -and $result -is [string] -and
+        (Test-Path -LiteralPath $result -PathType Leaf)) {
+        return $result
+    }
+}
+
+function Find-Python312 {
+    $launcher = Get-Command py.exe -CommandType Application -ErrorAction SilentlyContinue
+    if ($launcher) {
+        $found = Get-Python312 -Command $launcher.Source -CommandArgs @('-3.12-64')
+        if ($found) { return $found }
+    }
+
+    $paths = @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe')
+        (Join-Path $env:ProgramFiles 'Python312\python.exe')
+    )
+    $onPath = Get-Command python.exe -CommandType Application -ErrorAction SilentlyContinue
+    if ($onPath -and $onPath.Source -notlike '*\Microsoft\WindowsApps\python.exe') {
+        $paths += $onPath.Source
+    }
+    foreach ($path in $paths) {
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            $found = Get-Python312 -Command $path
+            if ($found) { return $found }
+        }
+    }
+}
+
+function Install-Python312 {
+    # Try both installers if the first one cannot provide a compatible interpreter.
+    $ErrorActionPreference = 'Continue'
+    $manager = Get-Command pymanager.exe -CommandType Application -ErrorAction SilentlyContinue
+    if ($manager) {
+        Write-Host 'Preparing Python 3.12 with Python Install Manager...'
+        & $manager.Source install 3.12 | Out-Host
+        $found = Get-Python312 -Command $manager.Source -CommandArgs @('exec', '-V:3.12')
+        if ($found) { return $found }
+    }
+
+    $winget = Get-Command winget.exe -CommandType Application -ErrorAction SilentlyContinue
+    if ($winget) {
+        Write-Host 'Installing Python 3.12 x64 for this user with WinGet...'
+        & $winget.Source install --id Python.Python.3.12 --exact --source winget --architecture x64 --scope user --silent --accept-package-agreements --accept-source-agreements --disable-interactivity | Out-Host
+        $found = Find-Python312
+        if ($found) { return $found }
+    }
+
+    throw 'Automatic setup could not find or install Python 3.12 x64. Install it from python.org, then run this launcher again.'
+}
+
+$python = Find-Python312
+if (-not $python) { $python = Install-Python312 }
+
+if (Test-Path -LiteralPath $venvPath) {
+    $backupName = $env:YOLO_VENV_DIR + '.backup-' + [guid]::NewGuid().ToString('N')
+    Rename-Item -LiteralPath $venvPath -NewName $backupName
+    Write-Host "Saved the previous YOLO environment as $backupName."
+}
+
+Write-Host "Creating the YOLO environment with $python..."
+& $python -I -m venv $venvPath
+if ($LASTEXITCODE -ne 0) { throw 'Creating the YOLO environment failed.' }
