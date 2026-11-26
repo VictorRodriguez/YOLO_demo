@@ -1,3 +1,67 @@
+@echo off
+setlocal EnableExtensions DisableDelayedExpansion
+pushd "%~dp0" || goto folder_error
+
+if not exist "demo.py" (
+    echo demo.py is missing. Put this launcher next to demo.py.
+    goto failed
+)
+
+set "VENV_PROBE=import platform, struct, sys; sys.exit(sys.version_info[:2] != (3, 12) or struct.calcsize('P') != 8 or platform.machine().upper() not in ('AMD64', 'X86_64') or sys.prefix == sys.base_prefix)"
+set "VENV_PY=.venv\Scripts\python.exe"
+call :check_venv
+if not errorlevel 1 goto check_models
+
+set "YOLO_VENV_DIR=.venv-yolo312"
+set "VENV_PY=%YOLO_VENV_DIR%\Scripts\python.exe"
+call :check_venv
+if not errorlevel 1 goto check_models
+
+set "YOLO_LAUNCHER=%CD%\%~nx0"
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { $lines=[IO.File]::ReadAllLines($env:YOLO_LAUNCHER); $start=[Array]::IndexOf($lines,':embedded_python_setup'); if ($start -lt 0) { throw 'Python setup section is missing.' }; $body=$lines[($start+1)..($lines.Length-1)] -join [Environment]::NewLine; & ([scriptblock]::Create($body)); exit 0 } catch { [Console]::Error.WriteLine(($_ | Out-String)); exit 1 }"
+if errorlevel 1 goto failed
+
+call :check_venv
+if errorlevel 1 goto failed
+
+:check_models
+call :models_ready
+if not errorlevel 1 goto check_runtime
+
+if not exist "requirements-export.txt" (
+    echo requirements-export.txt is missing. Extract the full YOLO demo package.
+    goto failed
+)
+if not exist "export_model.py" (
+    echo export_model.py is missing. Extract the full YOLO demo package.
+    goto failed
+)
+echo Installing export dependencies and preparing YOLO models...
+"%VENV_PY%" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+if errorlevel 1 goto failed
+"%VENV_PY%" -m pip install -r requirements-export.txt
+if errorlevel 1 goto failed
+"%VENV_PY%" export_model.py --int8
+if errorlevel 1 goto failed
+call :models_ready
+if errorlevel 1 (
+    echo Model export did not produce all FP32, FP16 and INT8 model files.
+    goto failed
+)
+
+:check_runtime
+"%VENV_PY%" -I -c "import cv2, numpy, openvino" >nul 2>&1
+if not errorlevel 1 goto launch
+if not exist "requirements.txt" (
+    echo requirements.txt is missing. Extract the full YOLO demo package.
+    goto failed
+)
+"%VENV_PY%" -m pip install -r requirements.txt
+if errorlevel 1 goto failed
+"%VENV_PY%" -I -c "import cv2, numpy, openvino"
+if errorlevel 1 goto failed
+
+:launch
 "%VENV_PY%" demo.py %*
 if errorlevel 1 goto failed
 popd
