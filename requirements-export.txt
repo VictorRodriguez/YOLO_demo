@@ -1,0 +1,3 @@
+-r requirements.txt
+ultralytics==8.4.218
+nncf==3.4.0
